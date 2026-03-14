@@ -1,8 +1,15 @@
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
+use argon2::Argon2;
 use clap::{Parser, Subcommand};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs;
+use std::io::{self, Write};
 use std::path::PathBuf;
+
 
 #[derive(Parser)]
 #[command(name = "hiro")]
@@ -15,102 +22,137 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Add,
-    Get { url: String },
+    Get { name: String },
     List,
-    Delete { url: String },
-    Generate,
+    Delete { name: String },
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+
+#[derive(Serialize, Deserialize)]
 struct Entry {
-    url: String,
     login: String,
     password: String,
 }
 
-#[derive(Serialize, Deserialize)]
-struct Database {
-    entries: HashMap<String, Entry>,
-}
 
-
-
-fn db_path() -> PathBuf {
-    let mut path = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    path.push(".hiro.json");
-    path
-}
-
-fn load_db() -> Database {
-    let path = db_path();
-    if path.exists() {
-        let data = fs::read_to_string(&path).unwrap_or_default();
-        serde_json::from_str(&data).unwrap_or(Database {
-            entries: HashMap::new(),
-        })
+fn storage_dir() -> PathBuf {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+    let exe_dir = exe.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let portable = exe_dir.join("hiro_data");
+    if portable.exists() || exe_dir.join("hiro_data.portable").exists() {
+        portable
     } else {
-        Database {
-            entries: HashMap::new(),
-        }
+        dirs_next::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".hiro")
     }
 }
 
-fn save_db(db: &Database) {
-    let path = db_path();
-    let data = serde_json::to_string_pretty(db).unwrap();
-    fs::write(path, data).unwrap();
+
+fn entry_path(name: &str) -> PathBuf {
+    storage_dir().join(format!("{}.enc", name))
 }
 
 
+fn derive_key(master: &str, salt: &[u8]) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    Argon2::default()
+        .hash_password_into(master.as_bytes(), salt, &mut key)
+        .unwrap();
+    key
+}
 
+fn encrypt(data: &[u8], key: &[u8; 32]) -> Vec<u8> {
+    let cipher = Aes256Gcm::new(key.into());
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let mut result = nonce_bytes.to_vec();
+    result.extend(cipher.encrypt(nonce, data).unwrap());
+    result
+}
+
+fn decrypt(data: &[u8], key: &[u8; 32]) -> Option<Vec<u8>> {
+    if data.len() < 12 { return None; }
+    let (nonce_bytes, ciphertext) = data.split_at(12);
+    let cipher = Aes256Gcm::new(key.into());
+    let nonce = Nonce::from_slice(nonce_bytes);
+    cipher.decrypt(nonce, ciphertext).ok()
+}
 
 
 fn main() {
     let cli = Cli::parse();
-    let mut db = load_db();
+    fs::create_dir_all(storage_dir()).unwrap();
+
+    let master = rpassword::prompt_password("master password: ").unwrap();
+    let salt = b"hiro-static-salt";
+    let key = derive_key(&master, salt);
 
     match cli.command {
         Commands::Add => {
-            let url = rpassword::prompt_password("URL сайта: ").unwrap();
-            let login = rpassword::prompt_password("Логин: ").unwrap();
-            let password = rpassword::prompt_password("Пароль: ").unwrap();
-            db.entries.insert(url.clone(), Entry { url: url.clone(), login, password });
-            save_db(&db);
-            println!("сохранено: {}", url);
+            print!("name (e.g. github.com): ");
+            io::stdout().flush().unwrap();
+            let mut name = String::new();
+            io::stdin().read_line(&mut name).unwrap();
+            let name = name.trim();
+
+            print!("login: ");
+            io::stdout().flush().unwrap();
+            let mut login = String::new();
+            io::stdin().read_line(&mut login).unwrap();
+            let login = login.trim().to_string();
+
+            let password = rpassword::prompt_password("password: ").unwrap();
+
+            let entry = Entry { login, password };
+            let json = serde_json::to_vec(&entry).unwrap();
+            let encrypted = encrypt(&json, &key);
+            fs::write(entry_path(name), encrypted).unwrap();
+            println!("saved: {}", name);
         }
-        Commands::Get { url } => {
-            match db.entries.get(&url) {
-                Some(e) => {
-                    println!("url:    {}", e.url);
-                    println!("логин:  {}", e.login);
-                    println!("пароль: {}", e.password);
+        Commands::Get { name } => {
+            let path = entry_path(&name);
+            if !path.exists() {
+                println!("not found: {}", name);
+                return;
+            }
+            let data = fs::read(path).unwrap();
+            match decrypt(&data, &key) {
+                Some(json) => {
+                    let entry: Entry = serde_json::from_slice(&json).unwrap();
+                    println!("login:    {}", entry.login);
+                    println!("password: {}", entry.password);
                 }
-                None => println!("не найдено: {}", url),
+                None => println!("wrong master password"),
             }
         }
         Commands::List => {
-            if db.entries.is_empty() {
-                println!("пусто");
-            } else {
-                for (url, e) in &db.entries {
-                    println!("{} ({})", url, e.login);
+            let dir = storage_dir();
+            let mut found = false;
+            for e in fs::read_dir(&dir).unwrap() {
+                let e = e.unwrap();
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if name.ends_with(".enc") {
+                    println!("{}", name.trim_end_matches(".enc"));
+                    found = true;
                 }
             }
-        }
-        Commands::Delete { url } => {
-            if db.entries.remove(&url).is_some() {
-                save_db(&db);
-                println!("удалено: {}", url);
-            } else {
-                println!("не найдено: {}", url);
+            if !found {
+                println!("empty");
             }
         }
-        Commands::Generate => {
-            use rand::Rng;
-            let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*".chars().collect();
-            let mut rng = rand::thread_rng();
-            let pwd: String = (0..20).map(|_| chars[rng.gen_range(0..chars.len())]).collect();
-            println!("пароль: {}", pwd);
+        Commands::Delete { name } => {
+            let path = entry_path(&name);
+            if path.exists() {
+                fs::remove_file(path).unwrap();
+                println!("deleted: {}", name);
+            } else {
+                println!("not found: {}", name);
+            }
         }
     }
 }
+
+
